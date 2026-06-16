@@ -469,38 +469,135 @@ async def kick_member(request):
         "content":f"{target} was kicked by {actor}"})
     return web.json_response({"ok":True,"group":pg})
 
-# ── HTTP: Chunked media upload ─────────────────────────────────
+# ── HTTP: Chunked media upload ────────────────────────────────
+# Videos are written to disk; images/audio stay in-memory base64.
+# Video storage cap: 3 GB.  Oldest files are deleted first when over limit.
+
+VIDEOS_DIR   = os.path.join(BASE_DIR, "videos")
+VIDEO_CAP    = 3 * 1024 * 1024 * 1024   # 3 GB in bytes
+os.makedirs(VIDEOS_DIR, exist_ok=True)
+
+def _ext_for_mime(mime: str) -> str:
+    return {
+        "video/mp4":       ".mp4",
+        "video/webm":      ".webm",
+        "video/ogg":       ".ogv",
+        "video/quicktime": ".mov",
+        "video/x-msvideo": ".avi",
+    }.get(mime, ".mp4")
+
+def enforce_video_cap():
+    """Delete oldest video files until total size is under VIDEO_CAP."""
+    try:
+        files = []
+        total = 0
+        for fname in os.listdir(VIDEOS_DIR):
+            fpath = os.path.join(VIDEOS_DIR, fname)
+            if os.path.isfile(fpath):
+                st = os.stat(fpath)
+                files.append((st.st_mtime, st.st_size, fpath))
+                total += st.st_size
+        if total <= VIDEO_CAP:
+            return
+        # Sort oldest first
+        files.sort(key=lambda x: x[0])
+        for mtime, size, fpath in files:
+            if total <= VIDEO_CAP:
+                break
+            try:
+                os.remove(fpath)
+                total -= size
+                print(f"[video-gc] Removed {fpath} ({size//1024//1024} MB)", flush=True)
+            except Exception as e:
+                print(f"[video-gc] Failed to remove {fpath}: {e}", flush=True)
+    except Exception as e:
+        print(f"[video-gc] Error: {e}", flush=True)
+
 pending_uploads = {}
 uploads_lock    = threading.Lock()
 
 async def upload_chunk(request):
-    body      = await request.json()
-    upload_id = body.get("upload_id","")
-    chunk_idx = int(body.get("chunk_idx", 0))
-    total     = int(body.get("total_chunks", 1))
-    data      = body.get("data","")
-    media_type= body.get("media_type","image")
-    room_id   = body.get("room_id","public")
-    sender    = body.get("sender","?")
-    mime      = body.get("mime","image/jpeg")
+    body       = await request.json()
+    upload_id  = body.get("upload_id","")
+    chunk_idx  = int(body.get("chunk_idx", 0))
+    total      = int(body.get("total_chunks", 1))
+    data       = body.get("data","")        # raw base64 (no data-URL prefix)
+    media_type = body.get("media_type","image")
+    room_id    = body.get("room_id","public")
+    sender     = body.get("sender","?")
+    mime       = body.get("mime","image/jpeg")
 
     with uploads_lock:
         if upload_id not in pending_uploads:
             pending_uploads[upload_id] = {
-                "chunks":{}, "total":total, "type":media_type,
-                "room":room_id, "sender":sender, "mime":mime
+                "chunks": {}, "total": total, "type": media_type,
+                "room": room_id, "sender": sender, "mime": mime,
             }
         pending_uploads[upload_id]["chunks"][chunk_idx] = data
         up = pending_uploads[upload_id]
-        if len(up["chunks"]) >= up["total"]:
-            ordered   = "".join(up["chunks"][i] for i in range(up["total"]))
-            full_data = f"data:{mime};base64,{ordered}"
-            payload   = {"type":up["type"],"name":up["sender"],"content":full_data,"room":up["room"]}
-            store_message(up["room"], payload)
-            del pending_uploads[upload_id]
-            asyncio.ensure_future(broadcast(up["room"], payload))
-            return web.json_response({"ok":True,"complete":True})
-    return web.json_response({"ok":True,"complete":False})
+
+        if len(up["chunks"]) < up["total"]:
+            return web.json_response({"ok": True, "complete": False})
+
+        # ── All chunks received ───────────────────────────────
+        ordered = "".join(up["chunks"][i] for i in range(up["total"]))
+        del pending_uploads[upload_id]
+
+    # Decode and handle outside the lock
+    import base64 as _b64
+    raw_bytes = _b64.b64decode(ordered)
+
+    if up["type"] == "video":
+        # ── Write video to disk ───────────────────────────────
+        ext      = _ext_for_mime(mime)
+        fname    = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}{ext}"
+        fpath    = os.path.join(VIDEOS_DIR, fname)
+        with open(fpath, "wb") as f:
+            f.write(raw_bytes)
+        # Enforce 3 GB cap (runs in thread so we don't block the event loop)
+        threading.Thread(target=enforce_video_cap, daemon=True).start()
+        # Content is a URL path, not base64
+        content = f"/videos/{fname}"
+        payload = {
+            "type":    "video",
+            "name":    up["sender"],
+            "content": content,      # URL served by the /videos/ route
+            "room":    up["room"],
+        }
+    else:
+        # ── Images / audio stay as base64 data-URLs ───────────
+        import base64 as _b64x
+        b64str  = _b64x.b64encode(raw_bytes).decode()
+        content = f"data:{mime};base64,{b64str}"
+        payload = {
+            "type":    up["type"],
+            "name":    up["sender"],
+            "content": content,
+            "room":    up["room"],
+        }
+
+    store_message(up["room"], payload)
+    asyncio.ensure_future(broadcast(up["room"], payload))
+    return web.json_response({"ok": True, "complete": True})
+
+async def serve_video(request):
+    """Serve a video file from the videos directory."""
+    fname = request.match_info["filename"]
+    # Prevent path traversal
+    if "/" in fname or "\\" in fname or fname.startswith("."):
+        raise web.HTTPForbidden()
+    fpath = os.path.join(VIDEOS_DIR, fname)
+    if not os.path.isfile(fpath):
+        raise web.HTTPNotFound()
+    ext  = os.path.splitext(fname)[1].lower()
+    mime = {
+        ".mp4":  "video/mp4",
+        ".webm": "video/webm",
+        ".ogv":  "video/ogg",
+        ".mov":  "video/quicktime",
+        ".avi":  "video/x-msvideo",
+    }.get(ext, "video/mp4")
+    return web.FileResponse(fpath, headers={"Content-Type": mime})
 
 # ── HTTP: Misc ────────────────────────────────────────────────
 async def get_sounds(request):
@@ -710,6 +807,7 @@ app.router.add_post("/api/groups/promote",         promote_member)
 app.router.add_post("/api/groups/demote",          demote_member)
 app.router.add_post("/api/groups/kick",            kick_member)
 app.router.add_post("/api/upload/chunk",           upload_chunk)
+app.router.add_get("/videos/{filename}",           serve_video)
 
 # ── Keep-alive ────────────────────────────────────────────────
 SELF_URL = os.environ.get("SELF_URL","")
