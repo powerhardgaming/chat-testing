@@ -606,8 +606,7 @@ async def ws_handler(request):
                     typing_state[room].pop(username, None)
                 payload = {"type":"message","name":username,"content":content,"room":room}
                 store_message(room, payload)
-                await broadcast(room, payload)
-                await ws.send_json(payload)
+                await broadcast(room, payload)  # includes sender
 
             # ── Typing ────────────────────────────────────────
             elif t == "typing":
@@ -636,8 +635,7 @@ async def ws_handler(request):
                 content = data.get("content","")
                 payload = {"type":"audio","name":username,"content":content,"room":room}
                 store_message(room, payload)
-                await broadcast(room, payload)
-                await ws.send_json(payload)
+                await broadcast(room, payload)  # includes sender
 
     finally:
         # Always use user_info here — local `username` may be stale
